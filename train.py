@@ -15,6 +15,7 @@ import shutil
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Tuple, List
 
 import numpy as np
 import torch
@@ -110,7 +111,7 @@ class MultiContextDataset(Dataset):
         
         # Load prompt
         with open(os.path.join(sample_dir, 'prompt.txt'), 'r') as f:
-            prompt = f.read().strip()
+            prompt = "" # (TEMP PATCH) f.read().strip()
         
         # Load and process target image
         target_path = os.path.join(sample_dir, 'out.jpg')
@@ -152,42 +153,99 @@ class MultiContextDataset(Dataset):
         }
 
 
-def create_comparison_grid_simple(
+def letterbox_image(img: Image.Image, target_size: Tuple[int, int], color=(245, 245, 245)) -> Image.Image:
+    """Resize image preserving aspect ratio and pad to target size"""
+    w, h = img.size
+    target_w, target_h = target_size
+    
+    # Calculate scaling factor to fit within target size
+    scale = min(target_w / w, target_h / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    
+    # Resize preserving aspect ratio
+    img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # Create new image with padding
+    img_padded = Image.new('RGB', target_size, color)
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    img_padded.paste(img_resized, (paste_x, paste_y))
+    
+    return img_padded
+
+
+def create_validation_collage(
+    context_images: List[Image.Image],
     target_img: Image.Image,
-    generated_img: Image.Image, 
-    prompt: str,
+    base_output: Image.Image,
+    finetuned_output: Image.Image,
+    sample_name: str,
     step: int
 ) -> Image.Image:
-    """Create a simple side-by-side comparison for wandb"""
+    """Create a simple horizontal collage"""
     
-    # Resize to common size for comparison
-    size = (512, 512)
-    target_resized = target_img.resize(size, Image.Resampling.LANCZOS)
-    generated_resized = generated_img.resize(size, Image.Resampling.LANCZOS)
+    # Fixed sizes
+    main_h = 512
+    ctx_h = 256
+    padding = 10
     
-    # Create grid
-    grid = Image.new('RGB', (size[0] * 2 + 30, size[1] + 80), (245, 245, 245))
+    # Resize preserving aspect ratio
+    def resize_to_height(img, target_h):
+        w, h = img.size
+        new_w = int(w * target_h / h)
+        return img.resize((new_w, target_h), Image.Resampling.LANCZOS)
     
-    # Paste images
-    grid.paste(target_resized, (10, 40))
-    grid.paste(generated_resized, (size[0] + 20, 40))
+    # Resize all images to fixed heights
+    target_resized = resize_to_height(target_img, main_h)
+    base_resized = resize_to_height(base_output, main_h)
+    finetuned_resized = resize_to_height(finetuned_output, main_h)
+    context_resized = [resize_to_height(ctx, ctx_h) for ctx in context_images[:4]]  # Limit to 4 for space
     
-    # Add labels
+    # Calculate total width
+    ctx_total_w = sum(img.size[0] for img in context_resized) + len(context_resized) * padding
+    main_total_w = target_resized.size[0] + base_resized.size[0] + finetuned_resized.size[0] + 3 * padding
+    
+    # Create canvas
+    total_w = max(ctx_total_w, main_total_w) + 2 * padding
+    total_h = 80 + ctx_h + padding + main_h + 60
+    
+    grid = Image.new('RGB', (total_w, total_h), (245, 245, 245))
     draw = ImageDraw.Draw(grid)
+    
+    # Fonts
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        bold_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
     except:
         font = ImageFont.load_default()
-        small_font = font
+        bold_font = font
     
-    draw.text((10, 10), f"Step {step}", fill='black', font=font)
-    draw.text((10, size[1] + 45), "Target", fill='black', font=small_font)
-    draw.text((size[0] + 20, size[1] + 45), "Generated", fill='green', font=small_font)
+    # Title
+    draw.text((padding, 10), f"{sample_name} - Step {step}", fill='black', font=bold_font)
     
-    # Add truncated prompt at bottom
-    prompt_display = prompt[:100] + "..." if len(prompt) > 100 else prompt
-    draw.text((10, size[1] + 60), prompt_display, fill='gray', font=small_font)
+    # Context images row
+    draw.text((padding, 40), "Context:", fill='gray', font=font)
+    x_offset = padding
+    for ctx in context_resized:
+        grid.paste(ctx, (x_offset, 60))
+        x_offset += ctx.size[0] + padding
+    
+    # Main comparison row
+    y_main = 60 + ctx_h + 30
+    draw.text((padding, y_main - 20), "Target → Base → Finetuned:", fill='gray', font=font)
+    
+    x_offset = padding
+    grid.paste(target_resized, (x_offset, y_main))
+    draw.text((x_offset + target_resized.size[0]//2 - 20, y_main + main_h + 5), "Target", fill='black', font=font)
+    
+    x_offset += target_resized.size[0] + padding
+    grid.paste(base_resized, (x_offset, y_main))
+    draw.text((x_offset + base_resized.size[0]//2 - 20, y_main + main_h + 5), "Base", fill='blue', font=font)
+    
+    x_offset += base_resized.size[0] + padding
+    grid.paste(finetuned_resized, (x_offset, y_main))
+    draw.text((x_offset + finetuned_resized.size[0]//2 - 30, y_main + main_h + 5), "Finetuned", fill='green', font=font)
     
     return grid
 
@@ -196,7 +254,7 @@ def create_comparison_grid_simple(
 def run_validation(step, accelerator, transformer, text_encoder_one, text_encoder_two,
                   vae, tokenizer_one, tokenizer_two, noise_scheduler_copy, 
                   validation_samples, args, weight_dtype):
-    """Run validation with manual inference approach for multi-context support"""
+    """Run validation with base model comparison and better layout"""
     
     from diffusers import FlowMatchEulerDiscreteScheduler, FluxKontextPipeline
     from diffusers.pipelines.flux.pipeline_flux_img2img import calculate_shift
@@ -206,16 +264,14 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
     
     logger.info(f"Running validation at step {step}")
     
+    # Create step directory
+    step_dir = os.path.join(args.output_dir, "validation", f"step_{step}")
+    os.makedirs(step_dir, exist_ok=True)
+    
     # Put models in eval mode
     transformer.eval()
     if args.train_text_encoder:
         text_encoder_one.eval()
-    
-    # Unwrap PEFT models
-    unwrapped_transformer = accelerator.unwrap_model(transformer)
-    unwrapped_te = accelerator.unwrap_model(text_encoder_one) if args.train_text_encoder else text_encoder_one
-    
-    wandb_images = []
     
     # Get VAE config values
     vae_config_shift_factor = vae.config.shift_factor
@@ -223,209 +279,213 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
     vae_config_block_out_channels = vae.config.block_out_channels
     vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
     
-    for i, sample in enumerate(validation_samples):
+    # Load base transformer for comparison (without LoRA)
+    logger.info("Loading base model for comparison...")
+    base_transformer = FluxTransformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype
+    ).to(accelerator.device)
+    base_transformer.eval()
+    
+    # Process each validation sample
+    for sample_idx, sample in enumerate(validation_samples):
         try:
-            prompt = sample["txt"]
-            target_tensor = sample["img"]  # This is already at the right resolution from dataset
+            logger.info(f"Processing validation sample {sample_idx + 1}/{len(validation_samples)}")
+            
+            prompt = ""  # Using blank prompts as you mentioned
+            target_tensor = sample["img"]
             context_tensors = sample["context_images"]
             
-            # Get target dimensions from the actual sample
-            # target_tensor shape is [C, H, W]
+            # Get dimensions
             target_h, target_w = target_tensor.shape[1], target_tensor.shape[2]
             
-            # Process text prompts
-            # CLIP encoding
-            text_inputs_clip = tokenizer_one(
-                prompt,
-                padding="max_length",
-                max_length=77,
-                truncation=True,
-                return_tensors="pt"
-            )
-            clip_output = unwrapped_te(
-                text_inputs_clip.input_ids.to(accelerator.device),
-                output_hidden_states=False
-            )
-            pooled_prompt_embeds = clip_output.pooler_output.to(dtype=weight_dtype)
-            
-            # T5 encoding
-            text_inputs_t5 = tokenizer_two(
-                prompt,
-                padding="max_length",
-                max_length=args.max_sequence_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            prompt_embeds = text_encoder_two(
-                text_inputs_t5.input_ids.to(accelerator.device),
-                output_hidden_states=False
-            )[0].to(dtype=weight_dtype)
-            
-            text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
-            
-            # Process context images
-            context_latents_list = []
-            context_ids_list = []
-            
-            for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
-                # Context tensor is already normalized to [-1, 1]
-                ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
+            # Common setup for both base and finetuned inference
+            def run_inference(use_finetuned=True):
+                # Select transformer
+                current_transformer = accelerator.unwrap_model(transformer) if use_finetuned else base_transformer
+                current_te = accelerator.unwrap_model(text_encoder_one) if use_finetuned and args.train_text_encoder else text_encoder_one
                 
-                # Encode with VAE
-                ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
-                ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
-                
-                # Pack latents
-                h, w = ctx_latent.shape[2:]
-                packed = FluxKontextPipeline._pack_latents(
-                    ctx_latent, 1, ctx_latent.shape[1], h, w
+                # Text encoding (blank prompt)
+                text_inputs_clip = tokenizer_one(
+                    prompt,
+                    padding="max_length",
+                    max_length=77,
+                    truncation=True,
+                    return_tensors="pt"
                 )
-                context_latents_list.append(packed)
-                
-                # Prepare IDs with tau
-                ids = FluxKontextPipeline._prepare_latent_image_ids(
-                    1, h // 2, w // 2, accelerator.device, weight_dtype
+                clip_output = current_te(
+                    text_inputs_clip.input_ids.to(accelerator.device),
+                    output_hidden_states=False
                 )
-                ids[..., 0] = 1.0 + idx * args.time_spacing
-                context_ids_list.append(ids)
-            
-            # Prepare target latents (noise)
-            generator = torch.Generator(device="cpu").manual_seed(42 + i)
-            target_shape = (1, vae.config.latent_channels, target_h // vae_scale_factor, target_w // vae_scale_factor)
-            latents = torch.randn(target_shape, generator=generator, dtype=torch.float32)
-            latents = latents.to(device=accelerator.device, dtype=weight_dtype)
-            packed_latents = FluxKontextPipeline._pack_latents(
-                latents, 1, latents.shape[1], latents.shape[2], latents.shape[3]
-            )
-            
-            # Prepare target IDs
-            target_ids = FluxKontextPipeline._prepare_latent_image_ids(
-                1, latents.shape[2] // 2, latents.shape[3] // 2,
-                accelerator.device, weight_dtype
-            )
-            target_ids[..., 0] = 0
-            
-            # Combine all latents and IDs
-            combined_latents = torch.cat([packed_latents] + context_latents_list, dim=1)
-            
-            all_ids = [target_ids] + context_ids_list
-            combined_ids = torch.cat(all_ids, dim=0)
-            
-            # Prepare guidance
-            base_model = unwrapped_transformer.get_base_model() if hasattr(unwrapped_transformer, 'get_base_model') else unwrapped_transformer
-            if getattr(base_model.config, "guidance_embeds", False):
-                guidance = torch.tensor([args.guidance_scale], device=accelerator.device, dtype=weight_dtype)
-            else:
-                guidance = None
-            
-            # Set up scheduler for inference
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="scheduler"
-            )
-            
-            # Calculate shift
-            image_seq_len = packed_latents.shape[1]
-            mu = calculate_shift(
-                image_seq_len,
-                scheduler.config.base_image_seq_len,
-                scheduler.config.max_image_seq_len,
-                scheduler.config.base_shift,
-                scheduler.config.max_shift,
-            )
-            
-            # Set timesteps
-            sigmas = np.linspace(1.0, 1 / args.validation_inference_steps, args.validation_inference_steps)
-            scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=accelerator.device)
-            timesteps = scheduler.timesteps
-            
-            # Denoising loop
-            for t in timesteps:
-                timestep = t.expand(packed_latents.shape[0]).to(dtype=weight_dtype)
+                pooled_prompt_embeds = clip_output.pooler_output.to(dtype=weight_dtype)
                 
-                # Transformer prediction
-                noise_pred = unwrapped_transformer(
-                    hidden_states=combined_latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=combined_ids,
-                    return_dict=False,
-                )[0]
-                
-                # Extract only target prediction
-                noise_pred = noise_pred[:, :packed_latents.size(1)]
-                
-                # Scheduler step
-                packed_latents = scheduler.step(noise_pred, t, packed_latents, return_dict=False)[0]
-                
-                # Update combined latents for next iteration
-                combined_latents = torch.cat(
-                    [packed_latents] + context_latents_list,
-                    dim=1
+                text_inputs_t5 = tokenizer_two(
+                    prompt,
+                    padding="max_length",
+                    max_length=args.max_sequence_length,
+                    truncation=True,
+                    return_tensors="pt"
                 )
+                prompt_embeds = text_encoder_two(
+                    text_inputs_t5.input_ids.to(accelerator.device),
+                    output_hidden_states=False
+                )[0].to(dtype=weight_dtype)
+                
+                text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
+                
+                # Process context images
+                context_latents_list = []
+                context_ids_list = []
+                
+                for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
+                    ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
+                    ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
+                    ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
+                    
+                    h, w = ctx_latent.shape[2:]
+                    packed = FluxKontextPipeline._pack_latents(
+                        ctx_latent, 1, ctx_latent.shape[1], h, w
+                    )
+                    context_latents_list.append(packed)
+                    
+                    ids = FluxKontextPipeline._prepare_latent_image_ids(
+                        1, h // 2, w // 2, accelerator.device, weight_dtype
+                    )
+                    ids[..., 0] = 1.0 + idx * args.time_spacing
+                    context_ids_list.append(ids)
+                
+                # Prepare noise
+                generator = torch.Generator(device="cpu").manual_seed(42 + sample_idx)
+                target_shape = (1, vae.config.latent_channels, target_h // vae_scale_factor, target_w // vae_scale_factor)
+                latents = torch.randn(target_shape, generator=generator, dtype=torch.float32)
+                latents = latents.to(device=accelerator.device, dtype=weight_dtype)
+                packed_latents = FluxKontextPipeline._pack_latents(
+                    latents, 1, latents.shape[1], latents.shape[2], latents.shape[3]
+                )
+                
+                target_ids = FluxKontextPipeline._prepare_latent_image_ids(
+                    1, latents.shape[2] // 2, latents.shape[3] // 2,
+                    accelerator.device, weight_dtype
+                )
+                target_ids[..., 0] = 0
+                
+                combined_latents = torch.cat([packed_latents] + context_latents_list, dim=1)
+                combined_ids = torch.cat([target_ids] + context_ids_list, dim=0)
+                
+                # Guidance
+                base_model = current_transformer.get_base_model() if hasattr(current_transformer, 'get_base_model') else current_transformer
+                if getattr(base_model.config, "guidance_embeds", False):
+                    guidance = torch.tensor([args.guidance_scale], device=accelerator.device, dtype=weight_dtype)
+                else:
+                    guidance = None
+                
+                # Scheduler
+                scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                    args.pretrained_model_name_or_path, subfolder="scheduler"
+                )
+                
+                image_seq_len = packed_latents.shape[1]
+                mu = calculate_shift(
+                    image_seq_len,
+                    scheduler.config.base_image_seq_len,
+                    scheduler.config.max_image_seq_len,
+                    scheduler.config.base_shift,
+                    scheduler.config.max_shift,
+                )
+                
+                sigmas = np.linspace(1.0, 1 / args.validation_inference_steps, args.validation_inference_steps)
+                scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=accelerator.device)
+                timesteps = scheduler.timesteps
+                
+                # Denoising loop
+                for t in timesteps:
+                    timestep = t.expand(packed_latents.shape[0]).to(dtype=weight_dtype)
+                    
+                    noise_pred = current_transformer(
+                        hidden_states=combined_latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
+                        img_ids=combined_ids,
+                        return_dict=False,
+                    )[0]
+                    
+                    noise_pred = noise_pred[:, :packed_latents.size(1)]
+                    packed_latents = scheduler.step(noise_pred, t, packed_latents, return_dict=False)[0]
+                    combined_latents = torch.cat([packed_latents] + context_latents_list, dim=1)
+                
+                # Decode
+                final_latents = FluxKontextPipeline._unpack_latents(
+                    packed_latents, height=target_h, width=target_w, vae_scale_factor=vae_scale_factor,
+                )
+                final_latents = (final_latents / vae_config_scaling_factor) + vae_config_shift_factor
+                final_latents = final_latents.to(dtype=weight_dtype)
+                
+                image = vae.decode(final_latents).sample
+                image = (image / 2 + 0.5).clamp(0, 1)
+                image = image.float().cpu().permute(0, 2, 3, 1).numpy()
+                image = (image * 255).astype(np.uint8)
+                return Image.fromarray(image[0])
             
-            # Unpack and decode
-            final_latents = FluxKontextPipeline._unpack_latents(
-                packed_latents,
-                height=target_h,
-                width=target_w,
-                vae_scale_factor=vae_scale_factor,
-            )
-            final_latents = (final_latents / vae_config_scaling_factor) + vae_config_shift_factor
-            final_latents = final_latents.to(dtype=weight_dtype)  # Ensure correct dtype for VAE
+            # Generate with base model
+            base_output = run_inference(use_finetuned=False)
             
-            # Decode with VAE
-            image = vae.decode(final_latents).sample
-            image = (image / 2 + 0.5).clamp(0, 1)
-            image = image.float().cpu().permute(0, 2, 3, 1).numpy()
-            image = (image * 255).astype(np.uint8)
-            generated_pil = Image.fromarray(image[0])
+            # Generate with finetuned model
+            finetuned_output = run_inference(use_finetuned=True)
             
             # Convert target tensor to PIL
             target_array = ((target_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
             target_pil = Image.fromarray(target_array)
             
-            # Create comparison grid
-            comparison = create_comparison_grid_simple(
-                target_pil, generated_pil, prompt, step
+            # Convert context tensors to PIL
+            context_pils = []
+            for ctx_tensor in context_tensors[:6]:  # Max 6 for display
+                ctx_array = ((ctx_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
+                context_pils.append(Image.fromarray(ctx_array))
+            
+            # Create collage
+            collage = create_validation_collage(
+                context_images=context_pils,
+                target_img=target_pil,
+                base_output=base_output,
+                finetuned_output=finetuned_output,
+                sample_name=f"sample_{sample_idx:03d}",
+                step=step
             )
             
-            # Log to wandb - both comparison and individual
-            wandb_images.append(wandb.Image(
-                comparison,
-                caption=f"Sample {i} | Step {step}"
-            ))
+            # Save collage
+            collage_path = os.path.join(step_dir, f"sample_{sample_idx:03d}.jpg")
+            collage.save(collage_path)
+            logger.info(f"Saved validation collage to {collage_path}")
             
-            # Also log just the generated image
-            wandb_images.append(wandb.Image(
-                generated_pil,
-                caption=f"Generated {i} | {prompt[:75]}..."
-            ))
+            # Also log to wandb if available
+            if is_wandb_available():
+                wandb.log({
+                    f"validation/sample_{sample_idx}": wandb.Image(collage),
+                    "global_step": step,
+                })
             
         except Exception as e:
-            logger.warning(f"Validation failed for sample {i}: {e}")
+            logger.warning(f"Validation failed for sample {sample_idx}: {e}")
             import traceback
             traceback.print_exc()
             continue
     
-    # Log all validation images to wandb
-    if wandb_images:
-        wandb.log({
-            "validation/comparisons": wandb_images,
-            "validation/step": step,
-            "global_step": step,
-        })
-        logger.info(f"Logged {len(wandb_images)} validation images to wandb")
-    
     # Cleanup
+    del base_transformer
     torch.cuda.empty_cache()
     
     # Back to training mode
     transformer.train()
     if args.train_text_encoder:
         text_encoder_one.train()
+    
+    logger.info(f"Validation complete. Results saved to {step_dir}")
 
 
 def get_validation_samples(dataset, num_samples=3, seed=42):
