@@ -2,6 +2,7 @@
 # coding=utf-8
 # Modified from original diffusers dreambooth training script for multi-context support
 # UPDATED: Uses PEFT for LoRA + simple save flags for adapters and merged single-file model.
+# UPDATED: Integrated validation with wandb logging
 
 import argparse
 import copy
@@ -25,7 +26,7 @@ from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
 from peft import LoraConfig, get_peft_model  # NEW: PEFT
 from peft.utils import get_peft_model_state_dict
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -64,23 +65,26 @@ check_min_version("0.34.0.dev0")
 logger = get_logger(__name__)
 
 
+# Preferred resolutions for bucketing
+PREFERRED_RESOLUTIONS = [
+    (672, 1568), (688, 1504), (720, 1456), (752, 1392),
+    (800, 1328), (832, 1248), (880, 1184), (944, 1104),
+    (1024, 1024), (1104, 944), (1184, 880), (1248, 832),
+    (1328, 800), (1392, 752), (1456, 720), (1504, 688), (1568, 672)
+]
+
+
 class MultiContextDataset(Dataset):
-    def __init__(self, root_dir, max_context_images=6, enable_assets=False):
+    def __init__(self, root_dir, max_context_images=6):
         self.root_dir = root_dir
         self.max_context_images = max_context_images
-        self.enable_assets = enable_assets
         
         self.samples = sorted([
             d for d in os.listdir(root_dir) 
             if os.path.isdir(os.path.join(root_dir, d)) and d.startswith('sample_')
         ])
         
-        self.PREFERRED_RESOLUTIONS = [
-            (672, 1568), (688, 1504), (720, 1456), (752, 1392),
-            (800, 1328), (832, 1248), (880, 1184), (944, 1104),
-            (1024, 1024), (1104, 944), (1184, 880), (1248, 832),
-            (1328, 800), (1392, 752), (1456, 720), (1504, 688), (1568, 672)
-        ]
+        self.PREFERRED_RESOLUTIONS = PREFERRED_RESOLUTIONS
         
     def find_best_resolution(self, img):
         w, h = img.size
@@ -141,27 +145,294 @@ class MultiContextDataset(Dataset):
                 img = img.resize((ctx_w, ctx_h), Image.Resampling.LANCZOS)
                 context_tensors.append(transform(img))
         
-        # Load asset images
-        asset_tensors = []
-        if self.enable_assets:
-            assets_dir = os.path.join(sample_dir, 'assets')
-            if os.path.exists(assets_dir):
-                asset_files = sorted([
-                    f for f in os.listdir(assets_dir)
-                    if f.endswith(('.jpg', '.jpeg', '.png'))
-                ])
-                for img_file in asset_files:
-                    img = Image.open(os.path.join(assets_dir, img_file)).convert('RGB')
-                    asset_w, asset_h = self.find_best_resolution(img)
-                    img = img.resize((asset_w, asset_h), Image.Resampling.LANCZOS)
-                    asset_tensors.append(transform(img))
-        
         return {
             "txt": prompt,
             "img": target_tensor,
             "context_images": context_tensors,
-            "asset_images": asset_tensors
         }
+
+
+def create_comparison_grid_simple(
+    target_img: Image.Image,
+    generated_img: Image.Image, 
+    prompt: str,
+    step: int
+) -> Image.Image:
+    """Create a simple side-by-side comparison for wandb"""
+    
+    # Resize to common size for comparison
+    size = (512, 512)
+    target_resized = target_img.resize(size, Image.Resampling.LANCZOS)
+    generated_resized = generated_img.resize(size, Image.Resampling.LANCZOS)
+    
+    # Create grid
+    grid = Image.new('RGB', (size[0] * 2 + 30, size[1] + 80), (245, 245, 245))
+    
+    # Paste images
+    grid.paste(target_resized, (10, 40))
+    grid.paste(generated_resized, (size[0] + 20, 40))
+    
+    # Add labels
+    draw = ImageDraw.Draw(grid)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+    except:
+        font = ImageFont.load_default()
+        small_font = font
+    
+    draw.text((10, 10), f"Step {step}", fill='black', font=font)
+    draw.text((10, size[1] + 45), "Target", fill='black', font=small_font)
+    draw.text((size[0] + 20, size[1] + 45), "Generated", fill='green', font=small_font)
+    
+    # Add truncated prompt at bottom
+    prompt_display = prompt[:100] + "..." if len(prompt) > 100 else prompt
+    draw.text((10, size[1] + 60), prompt_display, fill='gray', font=small_font)
+    
+    return grid
+
+
+@torch.no_grad()
+def run_validation(step, accelerator, transformer, text_encoder_one, text_encoder_two,
+                  vae, tokenizer_one, tokenizer_two, noise_scheduler_copy, 
+                  validation_samples, args, weight_dtype):
+    """Run validation with manual inference approach for multi-context support"""
+    
+    from diffusers import FlowMatchEulerDiscreteScheduler, FluxKontextPipeline
+    from diffusers.pipelines.flux.pipeline_flux_img2img import calculate_shift
+    
+    if not accelerator.is_main_process:
+        return
+    
+    logger.info(f"Running validation at step {step}")
+    
+    # Put models in eval mode
+    transformer.eval()
+    if args.train_text_encoder:
+        text_encoder_one.eval()
+    
+    # Unwrap PEFT models
+    unwrapped_transformer = accelerator.unwrap_model(transformer)
+    unwrapped_te = accelerator.unwrap_model(text_encoder_one) if args.train_text_encoder else text_encoder_one
+    
+    wandb_images = []
+    
+    # Get VAE config values
+    vae_config_shift_factor = vae.config.shift_factor
+    vae_config_scaling_factor = vae.config.scaling_factor
+    vae_config_block_out_channels = vae.config.block_out_channels
+    vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
+    
+    for i, sample in enumerate(validation_samples):
+        try:
+            prompt = sample["txt"]
+            target_tensor = sample["img"]  # This is already at the right resolution from dataset
+            context_tensors = sample["context_images"]
+            
+            # Get target dimensions from the actual sample
+            # target_tensor shape is [C, H, W]
+            target_h, target_w = target_tensor.shape[1], target_tensor.shape[2]
+            
+            # Process text prompts
+            # CLIP encoding
+            text_inputs_clip = tokenizer_one(
+                prompt,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt"
+            )
+            clip_output = unwrapped_te(
+                text_inputs_clip.input_ids.to(accelerator.device),
+                output_hidden_states=False
+            )
+            pooled_prompt_embeds = clip_output.pooler_output.to(dtype=weight_dtype)
+            
+            # T5 encoding
+            text_inputs_t5 = tokenizer_two(
+                prompt,
+                padding="max_length",
+                max_length=args.max_sequence_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            prompt_embeds = text_encoder_two(
+                text_inputs_t5.input_ids.to(accelerator.device),
+                output_hidden_states=False
+            )[0].to(dtype=weight_dtype)
+            
+            text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
+            
+            # Process context images
+            context_latents_list = []
+            context_ids_list = []
+            
+            for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
+                # Context tensor is already normalized to [-1, 1]
+                ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
+                
+                # Encode with VAE
+                ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
+                ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
+                
+                # Pack latents
+                h, w = ctx_latent.shape[2:]
+                packed = FluxKontextPipeline._pack_latents(
+                    ctx_latent, 1, ctx_latent.shape[1], h, w
+                )
+                context_latents_list.append(packed)
+                
+                # Prepare IDs with tau
+                ids = FluxKontextPipeline._prepare_latent_image_ids(
+                    1, h // 2, w // 2, accelerator.device, weight_dtype
+                )
+                ids[..., 0] = 1.0 + idx * args.time_spacing
+                context_ids_list.append(ids)
+            
+            # Prepare target latents (noise)
+            generator = torch.Generator(device="cpu").manual_seed(42 + i)
+            target_shape = (1, vae.config.latent_channels, target_h // vae_scale_factor, target_w // vae_scale_factor)
+            latents = torch.randn(target_shape, generator=generator, dtype=torch.float32)
+            latents = latents.to(device=accelerator.device, dtype=weight_dtype)
+            packed_latents = FluxKontextPipeline._pack_latents(
+                latents, 1, latents.shape[1], latents.shape[2], latents.shape[3]
+            )
+            
+            # Prepare target IDs
+            target_ids = FluxKontextPipeline._prepare_latent_image_ids(
+                1, latents.shape[2] // 2, latents.shape[3] // 2,
+                accelerator.device, weight_dtype
+            )
+            target_ids[..., 0] = 0
+            
+            # Combine all latents and IDs
+            combined_latents = torch.cat([packed_latents] + context_latents_list, dim=1)
+            
+            all_ids = [target_ids] + context_ids_list
+            combined_ids = torch.cat(all_ids, dim=0)
+            
+            # Prepare guidance
+            base_model = unwrapped_transformer.get_base_model() if hasattr(unwrapped_transformer, 'get_base_model') else unwrapped_transformer
+            if getattr(base_model.config, "guidance_embeds", False):
+                guidance = torch.tensor([args.guidance_scale], device=accelerator.device, dtype=weight_dtype)
+            else:
+                guidance = None
+            
+            # Set up scheduler for inference
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="scheduler"
+            )
+            
+            # Calculate shift
+            image_seq_len = packed_latents.shape[1]
+            mu = calculate_shift(
+                image_seq_len,
+                scheduler.config.base_image_seq_len,
+                scheduler.config.max_image_seq_len,
+                scheduler.config.base_shift,
+                scheduler.config.max_shift,
+            )
+            
+            # Set timesteps
+            sigmas = np.linspace(1.0, 1 / args.validation_inference_steps, args.validation_inference_steps)
+            scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=accelerator.device)
+            timesteps = scheduler.timesteps
+            
+            # Denoising loop
+            for t in timesteps:
+                timestep = t.expand(packed_latents.shape[0]).to(dtype=weight_dtype)
+                
+                # Transformer prediction
+                noise_pred = unwrapped_transformer(
+                    hidden_states=combined_latents,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=combined_ids,
+                    return_dict=False,
+                )[0]
+                
+                # Extract only target prediction
+                noise_pred = noise_pred[:, :packed_latents.size(1)]
+                
+                # Scheduler step
+                packed_latents = scheduler.step(noise_pred, t, packed_latents, return_dict=False)[0]
+                
+                # Update combined latents for next iteration
+                combined_latents = torch.cat(
+                    [packed_latents] + context_latents_list,
+                    dim=1
+                )
+            
+            # Unpack and decode
+            final_latents = FluxKontextPipeline._unpack_latents(
+                packed_latents,
+                height=target_h,
+                width=target_w,
+                vae_scale_factor=vae_scale_factor,
+            )
+            final_latents = (final_latents / vae_config_scaling_factor) + vae_config_shift_factor
+            final_latents = final_latents.to(dtype=weight_dtype)  # Ensure correct dtype for VAE
+            
+            # Decode with VAE
+            image = vae.decode(final_latents).sample
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = image.float().cpu().permute(0, 2, 3, 1).numpy()
+            image = (image * 255).astype(np.uint8)
+            generated_pil = Image.fromarray(image[0])
+            
+            # Convert target tensor to PIL
+            target_array = ((target_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
+            target_pil = Image.fromarray(target_array)
+            
+            # Create comparison grid
+            comparison = create_comparison_grid_simple(
+                target_pil, generated_pil, prompt, step
+            )
+            
+            # Log to wandb - both comparison and individual
+            wandb_images.append(wandb.Image(
+                comparison,
+                caption=f"Sample {i} | Step {step}"
+            ))
+            
+            # Also log just the generated image
+            wandb_images.append(wandb.Image(
+                generated_pil,
+                caption=f"Generated {i} | {prompt[:75]}..."
+            ))
+            
+        except Exception as e:
+            logger.warning(f"Validation failed for sample {i}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Log all validation images to wandb
+    if wandb_images:
+        wandb.log({
+            "validation/comparisons": wandb_images,
+            "validation/step": step,
+            "global_step": step,
+        })
+        logger.info(f"Logged {len(wandb_images)} validation images to wandb")
+    
+    # Cleanup
+    torch.cuda.empty_cache()
+    
+    # Back to training mode
+    transformer.train()
+    if args.train_text_encoder:
+        text_encoder_one.train()
+
+
+def get_validation_samples(dataset, num_samples=3, seed=42):
+    """Get fixed validation samples for consistent evaluation"""
+    torch.manual_seed(seed)
+    indices = torch.randperm(len(dataset))[:min(num_samples, len(dataset))].tolist()
+    return [dataset[i] for i in indices]
 
 
 def save_model_card(repo_id, images=None, base_model=None, train_text_encoder=False,
@@ -232,6 +503,88 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path, re
         raise ValueError(f"{model_class} is not supported.")
 
 
+def tokenize_prompt(tokenizer, prompt, max_sequence_length):
+    text_inputs = tokenizer(
+        prompt, padding="max_length", max_length=max_sequence_length,
+        truncation=True, return_length=False, return_overflowing_tokens=False,
+        return_tensors="pt"
+    )
+    return text_inputs.input_ids
+
+
+def _encode_prompt_with_t5(text_encoder, tokenizer, max_sequence_length=512,
+                          prompt=None, num_images_per_prompt=1, device=None, text_input_ids=None):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    if tokenizer is not None:
+        text_inputs = tokenizer(
+            prompt, padding="max_length", max_length=max_sequence_length,
+            truncation=True, return_length=False, return_overflowing_tokens=False,
+            return_tensors="pt"
+        )
+        text_input_ids = text_inputs.input_ids
+    else:
+        if text_input_ids is None:
+            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
+
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+    dtype = text_encoder.dtype
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    _, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+    return prompt_embeds
+
+
+def _encode_prompt_with_clip(text_encoder, tokenizer, prompt, device=None,
+                            text_input_ids=None, num_images_per_prompt=1):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    if tokenizer is not None:
+        text_inputs = tokenizer(
+            prompt, padding="max_length", max_length=77, truncation=True,
+            return_overflowing_tokens=False, return_length=False, return_tensors="pt"
+        )
+        text_input_ids = text_inputs.input_ids
+    else:
+        if text_input_ids is None:
+            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
+
+    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
+    dtype = text_encoder.dtype
+    prompt_embeds = prompt_embeds.pooler_output
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+    return prompt_embeds
+
+
+def encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length,
+                 device=None, num_images_per_prompt=1, text_input_ids_list=None):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    dtype = text_encoders[0].dtype
+
+    pooled_prompt_embeds = _encode_prompt_with_clip(
+        text_encoder=text_encoders[0], tokenizer=tokenizers[0],
+        prompt=prompt, device=device if device is not None else text_encoders[0].device,
+        num_images_per_prompt=num_images_per_prompt,
+        text_input_ids=text_input_ids_list[0] if text_input_ids_list else None
+    )
+
+    prompt_embeds = _encode_prompt_with_t5(
+        text_encoder=text_encoders[1], tokenizer=tokenizers[1],
+        max_sequence_length=max_sequence_length, prompt=prompt,
+        num_images_per_prompt=num_images_per_prompt,
+        device=device if device is not None else text_encoders[1].device,
+        text_input_ids=text_input_ids_list[1] if text_input_ids_list else None
+    )
+
+    text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
+    return prompt_embeds, pooled_prompt_embeds, text_ids
+
+
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Multi-context Flux Kontext LoRA training script.")
     
@@ -250,8 +603,6 @@ def parse_args(input_args=None):
                        help="Maximum number of context images to use")
     parser.add_argument("--time_spacing", type=float, default=1.0,
                        help="Spacing between tau values for context images")
-    parser.add_argument("--enable_assets", action="store_true",
-                       help="Enable loading asset images")
     
     # Training arguments
     parser.add_argument("--output_dir", type=str, default="flux-kontext-lora-multi",
@@ -361,6 +712,14 @@ def parse_args(input_args=None):
     parser.add_argument("--max_shard_size", type=str, default="100GB",
                         help="Shard threshold for safetensors; set large to force a single file.")
     
+    # Validation arguments
+    parser.add_argument("--validation_steps", type=int, default=500,
+                       help="Run validation every X steps")
+    parser.add_argument("--num_validation_samples", type=int, default=3,
+                       help="Number of samples to validate")
+    parser.add_argument("--validation_inference_steps", type=int, default=20,
+                       help="Inference steps for validation (less = faster)")
+    
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -371,88 +730,6 @@ def parse_args(input_args=None):
         args.local_rank = env_local_rank
 
     return args
-
-
-def tokenize_prompt(tokenizer, prompt, max_sequence_length):
-    text_inputs = tokenizer(
-        prompt, padding="max_length", max_length=max_sequence_length,
-        truncation=True, return_length=False, return_overflowing_tokens=False,
-        return_tensors="pt"
-    )
-    return text_inputs.input_ids
-
-
-def _encode_prompt_with_t5(text_encoder, tokenizer, max_sequence_length=512,
-                          prompt=None, num_images_per_prompt=1, device=None, text_input_ids=None):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt, padding="max_length", max_length=max_sequence_length,
-            truncation=True, return_length=False, return_overflowing_tokens=False,
-            return_tensors="pt"
-        )
-        text_input_ids = text_inputs.input_ids
-    else:
-        if text_input_ids is None:
-            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
-
-    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-    _, seq_len, _ = prompt_embeds.shape
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-    return prompt_embeds
-
-
-def _encode_prompt_with_clip(text_encoder, tokenizer, prompt, device=None,
-                            text_input_ids=None, num_images_per_prompt=1):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt, padding="max_length", max_length=77, truncation=True,
-            return_overflowing_tokens=False, return_length=False, return_tensors="pt"
-        )
-        text_input_ids = text_inputs.input_ids
-    else:
-        if text_input_ids is None:
-            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
-
-    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.pooler_output
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
-    return prompt_embeds
-
-
-def encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length,
-                 device=None, num_images_per_prompt=1, text_input_ids_list=None):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    dtype = text_encoders[0].dtype
-
-    pooled_prompt_embeds = _encode_prompt_with_clip(
-        text_encoder=text_encoders[0], tokenizer=tokenizers[0],
-        prompt=prompt, device=device if device is not None else text_encoders[0].device,
-        num_images_per_prompt=num_images_per_prompt,
-        text_input_ids=text_input_ids_list[0] if text_input_ids_list else None
-    )
-
-    prompt_embeds = _encode_prompt_with_t5(
-        text_encoder=text_encoders[1], tokenizer=tokenizers[1],
-        max_sequence_length=max_sequence_length, prompt=prompt,
-        num_images_per_prompt=num_images_per_prompt,
-        device=device if device is not None else text_encoders[1].device,
-        text_input_ids=text_input_ids_list[1] if text_input_ids_list else None
-    )
-
-    text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
-    return prompt_embeds, pooled_prompt_embeds, text_ids
 
 
 def main(args):
@@ -489,9 +766,12 @@ def main(args):
     # Create dataset
     train_dataset = MultiContextDataset(
         root_dir=args.data_dir,
-        max_context_images=args.max_context_images,
-        enable_assets=args.enable_assets
+        max_context_images=args.max_context_images
     )
+    
+    # Get validation samples
+    validation_samples = get_validation_samples(train_dataset, args.num_validation_samples)
+    logger.info(f"Selected {len(validation_samples)} validation samples")
 
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -732,7 +1012,6 @@ def main(args):
                 prompts = batch["txt"]
                 target_images = batch["img"]
                 context_images_list = batch["context_images"][0] if batch["context_images"] else []
-                asset_images_list = batch["asset_images"][0] if batch["asset_images"] else []
     
                 # Encode prompts
                 if not args.train_text_encoder:
@@ -791,37 +1070,6 @@ def main(args):
                         context_latents_list.append(ctx_packed)
                         context_ids_list.append(ctx_ids)
     
-                # Process asset images if enabled
-                asset_latents_list = []
-                asset_ids_list = []
-                
-                if args.enable_assets and len(asset_images_list) > 0:
-                    for j, asset_tensor in enumerate(asset_images_list):
-                        asset_tensor = asset_tensor.unsqueeze(0).to(dtype=vae.dtype, device=accelerator.device)
-                        
-                        if args.vae_encode_mode == "sample":
-                            asset_latent = vae.encode(asset_tensor).latent_dist.sample()
-                        else:
-                            asset_latent = vae.encode(asset_tensor).latent_dist.mode()
-                        
-                        asset_latent = (asset_latent - vae_config_shift_factor) * vae_config_scaling_factor
-                        asset_latent = asset_latent.to(dtype=weight_dtype)
-                        
-                        # Pack latents
-                        asset_h, asset_w = asset_latent.shape[2:]
-                        asset_packed = FluxKontextPipeline._pack_latents(
-                            asset_latent, 1, asset_latent.shape[1], asset_h, asset_w
-                        )
-                        
-                        # Prepare IDs with tau = 101+
-                        asset_ids = FluxKontextPipeline._prepare_latent_image_ids(
-                            1, asset_h // 2, asset_w // 2, accelerator.device, weight_dtype
-                        )
-                        asset_ids[..., 0] = 101.0 + j
-                        
-                        asset_latents_list.append(asset_packed)
-                        asset_ids_list.append(asset_ids)
-    
                 # Sample noise and timesteps
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
@@ -849,8 +1097,6 @@ def main(args):
                 id_parts = [latent_ids]
                 if context_ids_list:
                     id_parts.extend(context_ids_list)
-                if asset_ids_list:
-                    id_parts.extend(asset_ids_list)
                 combined_latent_ids = torch.cat(id_parts, dim=0)
                 
                 # Add noise
@@ -885,8 +1131,6 @@ def main(args):
                 latent_parts = [packed_noisy_model_input]
                 if context_latents_list:
                     latent_parts.extend(context_latents_list)
-                if asset_latents_list:
-                    latent_parts.extend(asset_latents_list)
                 latent_model_input = torch.cat(latent_parts, dim=1)
                 
                 # Forward pass
@@ -939,6 +1183,15 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                
+                # Run validation periodically
+                if global_step % args.validation_steps == 0:
+                    run_validation(
+                        global_step, accelerator, transformer,
+                        text_encoder_one, text_encoder_two, vae,
+                        tokenizer_one, tokenizer_two, noise_scheduler_copy,
+                        validation_samples, args, weight_dtype
+                    )
     
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -965,6 +1218,19 @@ def main(args):
     
             if global_step >= args.max_train_steps:
                 break
+                
+        if global_step >= args.max_train_steps:
+            break
+
+    # Run final validation
+    if accelerator.is_main_process:
+        logger.info("Running final validation...")
+        run_validation(
+            global_step, accelerator, transformer,
+            text_encoder_one, text_encoder_two, vae,
+            tokenizer_one, tokenizer_two, noise_scheduler_copy,
+            validation_samples, args, weight_dtype
+        )
 
     # ---------------------------
     # Saving (simple & robust)

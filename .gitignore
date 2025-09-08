@@ -2,3 +2,4 @@ kontext-lora/
 lora_out/
 wandb/
 *.safetensors
+.ipynb_checkpoints/
