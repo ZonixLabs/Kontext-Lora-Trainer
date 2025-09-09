@@ -3,3 +3,6 @@ lora_out/
 wandb/
 *.safetensors
 .ipynb_checkpoints/
+kontext-full-finetune/
+kontext-lora-inscene/
+test-run/

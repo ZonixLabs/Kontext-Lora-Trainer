@@ -1,0 +1,6 @@
+# test_config.yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+mixed_precision: 'no'
+num_machines: 1
+num_processes: 1
