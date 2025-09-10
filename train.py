@@ -1343,34 +1343,26 @@ def main(args):
         if global_step >= args.max_train_steps:
             break
 
-    # Run final validation
-    if accelerator.is_main_process:
-        logger.info("Running final validation...")
-        run_validation(
-            global_step, accelerator, transformer,
-            text_encoder_one, text_encoder_two, vae,
-            tokenizer_one, tokenizer_two, noise_scheduler_copy,
-            validation_samples, base_outputs, args, weight_dtype
-        )
-
     # Save final model
     accelerator.wait_for_everyone()
+    logger.info("Saving final model...")
+    
+    # Use accelerator's save method - handles FSDP automatically
+    accelerator.save_model(transformer, os.path.join(args.output_dir, "transformer"))
+    
+    if args.train_text_encoder:
+        accelerator.save_model(text_encoder_one, os.path.join(args.output_dir, "text_encoder"))
+    
     if accelerator.is_main_process:
-        transformer_to_save = accelerator.unwrap_model(transformer)
-        transformer_to_save.save_pretrained(
-            os.path.join(args.output_dir, "transformer"),
-            safe_serialization=True
-        )
-        
-        if args.train_text_encoder:
-            text_encoder_to_save = accelerator.unwrap_model(text_encoder_one)
-            text_encoder_to_save.save_pretrained(
-                os.path.join(args.output_dir, "text_encoder"),
-                safe_serialization=True
-            )
-        
-        logger.info(f"Saved final model to {args.output_dir}")
-
+        # Copy other necessary files (VAE, tokenizers, scheduler)
+        import shutil
+        for subfolder in ["scheduler", "tokenizer", "tokenizer_2", "vae"]:
+            src = os.path.join(args.pretrained_model_name_or_path, subfolder)
+            dst = os.path.join(args.output_dir, subfolder)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.copytree(src, dst)
+        logger.info(f"Model saved to {args.output_dir}")
+    
     accelerator.end_training()
 
 

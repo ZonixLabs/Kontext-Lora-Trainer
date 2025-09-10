@@ -23,9 +23,9 @@ accelerate launch --config_file accelerate_config.yaml train.py \
   --adam_beta2=0.95 \
   --adam_weight_decay=0.01 \
   --max_grad_norm=1.0 \
-  --num_train_epochs=100000 \
+  --num_train_epochs=999999 \
   --max_train_steps=5000 \
-  --checkpointing_steps=500 \
+  --checkpointing_steps=999999 \
   --dataloader_num_workers=0 \
   --max_sequence_length=512 \
   --weighting_scheme="logit_normal" \
