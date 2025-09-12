@@ -269,7 +269,7 @@ def precompute_base_outputs(validation_samples, base_transformer, text_encoder_o
     for sample_idx, sample in enumerate(validation_samples):
         logger.info(f"Pre-computing base output for sample {sample_idx + 1}/{len(validation_samples)}")
         
-        prompt = sample["prompt"]
+        prompt = sample["txt"]
         target_tensor = sample["img"]
         context_tensors = sample["context_images"]
         
@@ -435,7 +435,7 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
         try:
             logger.info(f"Processing validation sample {sample_idx + 1}/{args.num_validation_samples}")
             
-            prompt = sample["prompt"]
+            prompt = sample["txt"]
             target_tensor = sample["img"]
             context_tensors = sample["context_images"]
             
