@@ -31,6 +31,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+from accelerate.utils import DistributedType
 
 import diffusers
 from diffusers import (
@@ -407,27 +408,27 @@ def precompute_base_outputs(validation_samples, base_transformer, text_encoder_o
 def run_validation(step, accelerator, transformer, text_encoder_one, text_encoder_two,
                   vae, tokenizer_one, tokenizer_two, noise_scheduler_copy, 
                   validation_samples, base_outputs, args, weight_dtype):
-    """FSDP-compatible validation with full collage like LoRA version"""
+    """FSDP-compatible validation - ALL processes participate but only main saves"""
     
-    # Only run on main process to avoid FSDP issues
-    if not accelerator.is_main_process:
-        return
-        
+    # ALL processes must participate in validation with FSDP
+    # Remove the early return that was causing the hang
+    
     from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.pipelines.flux.pipeline_flux_img2img import calculate_shift
     
-    logger.info(f"Running validation at step {step}")
+    logger.info(f"Running validation at step {step} on process {accelerator.process_index}")
     
-    # Create step directory
-    step_dir = os.path.join(args.output_dir, "validation", f"step_{step}")
-    os.makedirs(step_dir, exist_ok=True)
+    # Create step directory (only main process)
+    if accelerator.is_main_process:
+        step_dir = os.path.join(args.output_dir, "validation", f"step_{step}")
+        os.makedirs(step_dir, exist_ok=True)
     
     # VAE config
     vae_config_shift_factor = vae.config.shift_factor
     vae_config_scaling_factor = vae.config.scaling_factor
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     
-    # Process each validation sample (respecting num_validation_samples)
+    # Process each validation sample
     for sample_idx in range(min(args.num_validation_samples, len(validation_samples))):
         sample = validation_samples[sample_idx]
         base_output = base_outputs[sample_idx] if sample_idx < len(base_outputs) else None
@@ -441,7 +442,7 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
             
             target_h, target_w = target_tensor.shape[1], target_tensor.shape[2]
             
-            # Text encoding
+            # Text encoding - all processes participate
             with accelerator.autocast():
                 text_inputs_clip = tokenizer_one(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
                 clip_output = text_encoder_one(text_inputs_clip.input_ids.to(accelerator.device), output_hidden_states=False)
@@ -495,14 +496,15 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
             sigmas = np.linspace(1.0, 1 / args.validation_inference_steps, args.validation_inference_steps)
             scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=accelerator.device)
             
-            # Denoising loop
+            # Denoising loop - ALL processes must participate
             with accelerator.autocast():
                 for i, t in enumerate(scheduler.timesteps):
-                    if i % 10 == 0:
+                    if i % 10 == 0 and accelerator.is_main_process:
                         logger.info(f"Sample {sample_idx + 1}: Denoising step {i}/{len(scheduler.timesteps)}")
                     
                     timestep = t.expand(packed_latents.shape[0]).to(dtype=weight_dtype)
                     
+                    # ALL processes run the transformer
                     noise_pred = transformer(
                         hidden_states=combined_latents,
                         timestep=timestep / 1000,
@@ -518,62 +520,68 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
                     packed_latents = scheduler.step(noise_pred, t, packed_latents, return_dict=False)[0]
                     combined_latents = torch.cat([packed_latents] + context_latents_list, dim=1)
             
-            # Decode
-            final_latents = FluxKontextPipeline._unpack_latents(packed_latents, height=target_h, width=target_w, vae_scale_factor=vae_scale_factor)
-            final_latents = (final_latents / vae_config_scaling_factor) + vae_config_shift_factor
-            final_latents = final_latents.to(dtype=vae.dtype)
-            
-            image = vae.decode(final_latents).sample
-            image = (image / 2 + 0.5).clamp(0, 1)
-            image = image.float().cpu().permute(0, 2, 3, 1).numpy()
-            image = np.clip(image * 255, 0, 255).astype(np.uint8)
-            finetuned_output = Image.fromarray(image[0])
-            
-            # Convert target tensor to PIL
-            target_array = ((target_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
-            target_pil = Image.fromarray(target_array)
-            
-            # Convert context tensors to PIL
-            context_pils = []
-            for ctx_tensor in context_tensors[:6]:  # Max 6 for display
-                ctx_array = ((ctx_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
-                context_pils.append(Image.fromarray(ctx_array))
-            
-            # Create collage using pre-computed base output
-            if base_output is not None:
-                collage = create_validation_collage(
-                    context_images=context_pils,
-                    target_img=target_pil,
-                    base_output=base_output,
-                    finetuned_output=finetuned_output,
-                    sample_name=f"sample_{sample_idx:03d}",
-                    step=step
-                )
-            else:
-                # Fallback if no base output - simple side by side
-                collage = Image.new('RGB', (target_pil.width + finetuned_output.width + 10, max(target_pil.height, finetuned_output.height)), (255, 255, 255))
-                collage.paste(target_pil, (0, 0))
-                collage.paste(finetuned_output, (target_pil.width + 10, 0))
-            
-            # Save collage
-            collage_path = os.path.join(step_dir, f"sample_{sample_idx:03d}.jpg")
-            collage.save(collage_path)
-            logger.info(f"Saved validation collage to {collage_path}")
-            
-            # Log to wandb
-            if is_wandb_available():
-                wandb.log({
-                    f"validation/sample_{sample_idx}": wandb.Image(collage, caption=f"Step {step} - Sample {sample_idx}"),
-                    "global_step": step,
-                })
+            # Only main process decodes and saves images
+            if accelerator.is_main_process:
+                # Decode
+                final_latents = FluxKontextPipeline._unpack_latents(packed_latents, height=target_h, width=target_w, vae_scale_factor=vae_scale_factor)
+                final_latents = (final_latents / vae_config_scaling_factor) + vae_config_shift_factor
+                final_latents = final_latents.to(dtype=vae.dtype)
                 
+                image = vae.decode(final_latents).sample
+                image = (image / 2 + 0.5).clamp(0, 1)
+                image = image.float().cpu().permute(0, 2, 3, 1).numpy()
+                image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                finetuned_output = Image.fromarray(image[0])
+                
+                # Convert target tensor to PIL
+                target_array = ((target_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
+                target_pil = Image.fromarray(target_array)
+                
+                # Convert context tensors to PIL
+                context_pils = []
+                for ctx_tensor in context_tensors[:6]:  # Max 6 for display
+                    ctx_array = ((ctx_tensor.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5).astype(np.uint8)
+                    context_pils.append(Image.fromarray(ctx_array))
+                
+                # Create collage using pre-computed base output
+                if base_output is not None:
+                    collage = create_validation_collage(
+                        context_images=context_pils,
+                        target_img=target_pil,
+                        base_output=base_output,
+                        finetuned_output=finetuned_output,
+                        sample_name=f"sample_{sample_idx:03d}",
+                        step=step
+                    )
+                else:
+                    # Fallback if no base output - simple side by side
+                    collage = Image.new('RGB', (target_pil.width + finetuned_output.width + 10, max(target_pil.height, finetuned_output.height)), (255, 255, 255))
+                    collage.paste(target_pil, (0, 0))
+                    collage.paste(finetuned_output, (target_pil.width + 10, 0))
+                
+                # Save collage
+                collage_path = os.path.join(step_dir, f"sample_{sample_idx:03d}.jpg")
+                collage.save(collage_path)
+                logger.info(f"Saved validation collage to {collage_path}")
+                
+                # Log to wandb
+                if is_wandb_available():
+                    wandb.log({
+                        f"validation/sample_{sample_idx}": wandb.Image(collage, caption=f"Step {step} - Sample {sample_idx}"),
+                        "global_step": step,
+                    })
+                    
         except Exception as e:
             logger.warning(f"Validation failed for sample {sample_idx}: {e}")
             import traceback
             traceback.print_exc()
             continue
     
-    logger.info(f"Validation complete. Results saved to {step_dir}")
+    # Synchronize all processes before returning
+    accelerator.wait_for_everyone()
+    
+    if accelerator.is_main_process:
+        logger.info(f"Validation complete. Results saved to {step_dir}")
 
 
 def get_validation_samples(dataset, num_samples=3, seed=42):
@@ -1123,11 +1131,16 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    # Training loop
+    # Training loop with debugging
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         if args.train_text_encoder:
             text_encoder_one.train()
+        
+        # Track initial state
+        if global_step == 0 and accelerator.is_main_process:
+            initial_param = next(transformer.parameters()).clone().detach()
+            logger.info(f"🔍 Initial param sample - mean: {initial_param.mean():.6f}, std: {initial_param.std():.6f}")
     
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
@@ -1285,8 +1298,34 @@ def main(args):
                 )
                 loss = loss.mean()
                 
+                # Check for NaN/Inf loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"❌ Invalid loss at step {global_step}: {loss.item()}")
+                    optimizer.zero_grad()
+                    continue
+                
                 # Backward pass
                 accelerator.backward(loss)
+                
+                # Debug: Check gradients after backward (every 20 steps)
+                if accelerator.sync_gradients and global_step % 20 == 0 and accelerator.is_main_process:
+                    grad_norm = 0.0
+                    param_norm = 0.0
+                    num_params_with_grad = 0
+                    
+                    for p in transformer.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.data.norm(2).item() ** 2
+                            param_norm += p.data.norm(2).item() ** 2
+                            num_params_with_grad += 1
+                    
+                    grad_norm = grad_norm ** 0.5
+                    param_norm = param_norm ** 0.5
+                    
+                    if grad_norm == 0:
+                        logger.warning(f"⚠️ Step {global_step}: ZERO gradients detected!")
+                    else:
+                        logger.info(f"📊 Step {global_step}: grad_norm={grad_norm:.4f}, param_norm={param_norm:.4f}, num_grads={num_params_with_grad}")
                 
                 if accelerator.sync_gradients:
                     params_to_clip = (
@@ -1296,43 +1335,73 @@ def main(args):
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
     
+                # Store params before optimizer step (for comparison)
+                if global_step % 20 == 0 and accelerator.is_main_process:
+                    sample_param_before = next(transformer.parameters()).clone().detach()
+                
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                
+                # Check if params actually changed (every 20 steps)
+                if global_step % 20 == 0 and accelerator.is_main_process:
+                    sample_param_after = next(transformer.parameters()).clone().detach()
+                    param_change = (sample_param_after - sample_param_before).abs().max().item()
+                    
+                    if param_change < 1e-8:
+                        logger.error(f"❌ Step {global_step}: Parameters DID NOT change! Change={param_change:.2e}")
+                    else:
+                        logger.info(f"✅ Step {global_step}: Parameters changed by {param_change:.6f}")
     
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
                 
+                # Log key metrics every 10 steps
+                if global_step % 10 == 0 and accelerator.is_main_process:
+                    actual_lr = optimizer.param_groups[0]['lr']
+                    logger.info(f"📈 Step {global_step}: loss={loss.item():.4f}, lr={actual_lr:.2e}")
+                
                 # Run validation periodically
                 if global_step % args.validation_steps == 0:
+                    logger.info(f"🎨 Starting validation at step {global_step}")
                     run_validation(
                         global_step, accelerator, transformer,
                         text_encoder_one, text_encoder_two, vae,
                         tokenizer_one, tokenizer_two, noise_scheduler_copy,
                         validation_samples, base_outputs, args, weight_dtype
                     )
+                    
+                    # After validation, check if model is still in training mode
+                    if accelerator.is_main_process:
+                        logger.info(f"Post-validation check - transformer.training={transformer.training}")
     
-                if accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                # Checkpoint saving (simplified - only main process checks)
+                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    if args.checkpoints_total_limit is not None:
+                        checkpoints = os.listdir(args.output_dir)
+                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
     
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-                                logger.info(f"Removing checkpoints: {', '.join(removing_checkpoints)}")
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                        if len(checkpoints) >= args.checkpoints_total_limit:
+                            num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                            removing_checkpoints = checkpoints[0:num_to_remove]
+                            logger.info(f"Removing checkpoints: {', '.join(removing_checkpoints)}")
+                            for removing_checkpoint in removing_checkpoints:
+                                removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                shutil.rmtree(removing_checkpoint)
     
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"💾 Saved checkpoint to {save_path}")
     
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item()}
+            if lr_scheduler is not None:
+                logs["lr"] = lr_scheduler.get_last_lr()[0]
+            elif accelerator.distributed_type == DistributedType.DEEPSPEED:
+                logs["lr"] = accelerator.unwrap_model(transformer).optimizer.param_groups[0]['lr']
+            else:
+                logs["lr"] = optimizer.param_groups[0]['lr']
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
     
@@ -1341,28 +1410,14 @@ def main(args):
                 
         if global_step >= args.max_train_steps:
             break
-
-    # Save final model
-    accelerator.wait_for_everyone()
-    logger.info("Saving final model...")
     
-    # Use accelerator's save method - handles FSDP automatically
-    accelerator.save_model(transformer, os.path.join(args.output_dir, "transformer"))
-    
-    if args.train_text_encoder:
-        accelerator.save_model(text_encoder_one, os.path.join(args.output_dir, "text_encoder"))
-    
-    if accelerator.is_main_process:
-        # Copy other necessary files (VAE, tokenizers, scheduler)
-        import shutil
-        for subfolder in ["scheduler", "tokenizer", "tokenizer_2", "vae"]:
-            src = os.path.join(args.pretrained_model_name_or_path, subfolder)
-            dst = os.path.join(args.output_dir, subfolder)
-            if os.path.exists(src) and not os.path.exists(dst):
-                shutil.copytree(src, dst)
-        logger.info(f"Model saved to {args.output_dir}")
-    
-    accelerator.end_training()
+    # Final parameter check
+    if accelerator.is_main_process and global_step > 0:
+        final_param = next(transformer.parameters()).clone().detach()
+        total_change = (final_param - initial_param).abs().max().item()
+        logger.info(f"🏁 Training complete. Total param change from start: {total_change:.6f}")
+        if total_change < 1e-6:
+            logger.error("❌ WARNING: Model parameters barely changed during training!")
 
 
 if __name__ == "__main__":
