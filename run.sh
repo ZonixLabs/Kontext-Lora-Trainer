@@ -5,7 +5,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 export NCCL_P2P_DISABLE=1
 
-accelerate launch --config_file accelerate_config.yaml train.py \
+accelerate launch train.py \
   --pretrained_model_name_or_path="black-forest-labs/FLUX.1-Kontext-dev" \
   --output_dir="kontext-full-finetune" \
   --mixed_precision="bf16" \
