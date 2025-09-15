@@ -16,8 +16,8 @@ accelerate launch train.py \
   --optimizer="adamw" \
   --report_to="wandb" \
   --data_dir="/workspace/data/train" \
-  --learning_rate=2e-6 \
-  --lr_scheduler="cosine_with_restarts" \
+  --learning_rate=1e-5 \
+  --lr_scheduler="cosine" \
   --lr_warmup_steps=500 \
   --lr_num_cycles=3 \
   --adam_beta2=0.95 \

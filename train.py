@@ -147,6 +147,57 @@ class MultiContextDataset(Dataset):
             "context_images": context_tensors,
         }
 
+def process_context_images_spatial(context_tensors, vae, vae_config_shift_factor, 
+                                  vae_config_scaling_factor, args, accelerator, weight_dtype):
+    """Process context images using spatial offset method (like ComfyUI's default)"""
+    context_latents_list = []
+    context_ids_list = []
+    
+    # Track accumulated dimensions for tiling
+    h_accumulated = 0
+    w_accumulated = 0
+    
+    for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
+        ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
+        
+        # Encode
+        if args.vae_encode_mode == "sample":
+            ctx_latent = vae.encode(ctx_tensor).latent_dist.sample()
+        else:
+            ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
+        
+        ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
+        ctx_latent = ctx_latent.to(dtype=weight_dtype)
+        
+        h, w = ctx_latent.shape[2:]
+        packed = FluxKontextPipeline._pack_latents(
+            ctx_latent, 1, ctx_latent.shape[1], h, w
+        )
+        context_latents_list.append(packed)
+        
+        # Prepare IDs with spatial offsets
+        ids = FluxKontextPipeline._prepare_latent_image_ids(
+            1, h // 2, w // 2, accelerator.device, weight_dtype
+        )
+        
+        # Key changes: Keep tau=1, add spatial offsets
+        ids[..., 0] = 1.0  # All context at tau=1
+        
+        # Smart tiling: choose direction based on current aspect ratio
+        if h_accumulated > w_accumulated:
+            # Stack horizontally
+            ids[..., 1] += 0
+            ids[..., 2] += w_accumulated
+            w_accumulated += w // 2
+        else:
+            # Stack vertically  
+            ids[..., 1] += h_accumulated
+            ids[..., 2] += 0
+            h_accumulated += h // 2
+        
+        context_ids_list.append(ids)
+    
+    return context_latents_list, context_ids_list
 
 def letterbox_image(img: Image.Image, target_size: Tuple[int, int], color=(245, 245, 245)) -> Image.Image:
     """Resize image preserving aspect ratio and pad to target size"""
@@ -305,26 +356,20 @@ def precompute_base_outputs(validation_samples, base_transformer, text_encoder_o
         
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
         
-        # Process context images
-        context_latents_list = []
-        context_ids_list = []
-        
-        for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
-            ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
-            ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
-            ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
-            
-            h, w = ctx_latent.shape[2:]
-            packed = FluxKontextPipeline._pack_latents(
-                ctx_latent, 1, ctx_latent.shape[1], h, w
+        # Process context images with spatial method
+        if len(context_tensors) > 0:
+            # Note: args.vae_encode_mode is always "mode" for precompute
+            temp_args = args
+            temp_vae_mode = args.vae_encode_mode
+            args.vae_encode_mode = "mode"  # Force mode for precompute
+            context_latents_list, context_ids_list = process_context_images_spatial(
+                context_tensors, vae, vae_config_shift_factor, 
+                vae_config_scaling_factor, args, accelerator, weight_dtype
             )
-            context_latents_list.append(packed)
-            
-            ids = FluxKontextPipeline._prepare_latent_image_ids(
-                1, h // 2, w // 2, accelerator.device, weight_dtype
-            )
-            ids[..., 0] = 1.0 + idx * args.time_spacing
-            context_ids_list.append(ids)
+            args.vae_encode_mode = temp_vae_mode  # Restore
+        else:
+            context_latents_list = []
+            context_ids_list = []
         
         # Prepare noise with fixed seed for consistency
         generator = torch.Generator(device="cpu").manual_seed(42 + sample_idx)
@@ -453,23 +498,20 @@ def run_validation(step, accelerator, transformer, text_encoder_one, text_encode
             
             text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=accelerator.device, dtype=weight_dtype)
             
-            # Process context images
-            context_latents_list = []
-            context_ids_list = []
-            
-            for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
-                ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=vae.dtype)
-                ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
-                ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
-                ctx_latent = ctx_latent.to(dtype=weight_dtype)
-                
-                h, w = ctx_latent.shape[2:]
-                packed = FluxKontextPipeline._pack_latents(ctx_latent, 1, ctx_latent.shape[1], h, w)
-                context_latents_list.append(packed)
-                
-                ids = FluxKontextPipeline._prepare_latent_image_ids(1, h // 2, w // 2, accelerator.device, weight_dtype)
-                ids[..., 0] = 1.0 + idx * args.time_spacing
-                context_ids_list.append(ids)
+            # Process context images with spatial method
+            if len(context_tensors) > 0:
+                # Note: validation always uses mode
+                temp_args = args
+                temp_vae_mode = args.vae_encode_mode
+                args.vae_encode_mode = "mode"  # Force mode for validation
+                context_latents_list, context_ids_list = process_context_images_spatial(
+                    context_tensors, vae, vae_config_shift_factor, 
+                    vae_config_scaling_factor, args, accelerator, weight_dtype
+                )
+                args.vae_encode_mode = temp_vae_mode  # Restore
+            else:
+                context_latents_list = []
+                context_ids_list = []
             
             # Prepare noise with same seed as base for fair comparison
             generator = torch.Generator(device="cpu").manual_seed(42 + sample_idx)
@@ -757,8 +799,8 @@ def parse_args(input_args=None):
                        help="Directory containing training data")
     parser.add_argument("--max_context_images", type=int, default=6,
                        help="Maximum number of context images to use")
-    parser.add_argument("--time_spacing", type=float, default=1.0,
-                       help="Spacing between tau values for context images")
+    # parser.add_argument("--time_spacing", type=float, default=1.0,
+    #                    help="Spacing between tau values for context images")
     
     # Training arguments
     parser.add_argument("--output_dir", type=str, default="flux-kontext-full-finetune",
@@ -1179,36 +1221,15 @@ def main(args):
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
     
-                # Process context images
-                context_latents_list = []
-                context_ids_list = []
-
+                # Process context images with spatial method
                 if len(context_images_list) > 0:
-                    for i, ctx_tensor in enumerate(context_images_list[:args.max_context_images]):
-                        ctx_tensor = ctx_tensor.unsqueeze(0).to(dtype=vae.dtype, device=accelerator.device)
-                        
-                        if args.vae_encode_mode == "sample":
-                            ctx_latent = vae.encode(ctx_tensor).latent_dist.sample()
-                        else:
-                            ctx_latent = vae.encode(ctx_tensor).latent_dist.mode()
-                        
-                        ctx_latent = (ctx_latent - vae_config_shift_factor) * vae_config_scaling_factor
-                        ctx_latent = ctx_latent.to(dtype=weight_dtype)
-                        
-                        # Pack latents
-                        ctx_h, ctx_w = ctx_latent.shape[2:]
-                        ctx_packed = FluxKontextPipeline._pack_latents(
-                            ctx_latent, 1, ctx_latent.shape[1], ctx_h, ctx_w
-                        )
-                        
-                        # Prepare IDs with proper tau
-                        ctx_ids = FluxKontextPipeline._prepare_latent_image_ids(
-                            1, ctx_h // 2, ctx_w // 2, accelerator.device, weight_dtype
-                        )
-                        ctx_ids[..., 0] = 1.0 + i * args.time_spacing
-                        
-                        context_latents_list.append(ctx_packed)
-                        context_ids_list.append(ctx_ids)
+                    context_latents_list, context_ids_list = process_context_images_spatial(
+                        context_images_list, vae, vae_config_shift_factor, 
+                        vae_config_scaling_factor, args, accelerator, weight_dtype
+                    )
+                else:
+                    context_latents_list = []
+                    context_ids_list = []
     
                 # Sample noise and timesteps
                 noise = torch.randn_like(model_input)
