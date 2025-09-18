@@ -149,15 +149,18 @@ class MultiContextDataset(Dataset):
 
 def process_context_images_spatial(context_tensors, vae, vae_config_shift_factor, 
                                   vae_config_scaling_factor, args, accelerator, weight_dtype):
-    """Process context images using spatial offset method (like ComfyUI's default)"""
+    """Process context images using spatial offset method - horizontal stacking only"""
     context_latents_list = []
     context_ids_list = []
     
-    # Track accumulated dimensions for tiling
-    h_accumulated = 0
+    # Reverse the order so most recent (highest numbered) images come first
+    # This assumes your dataset provides them in ascending order (1.jpg, 2.jpg, etc.)
+    context_tensors = list(reversed(context_tensors[:args.max_context_images]))
+    
+    # Track accumulated width for horizontal stacking
     w_accumulated = 0
     
-    for idx, ctx_tensor in enumerate(context_tensors[:args.max_context_images]):
+    for idx, ctx_tensor in enumerate(context_tensors):
         ctx_tensor = ctx_tensor.unsqueeze(0).to(device=accelerator.device, dtype=weight_dtype)
         
         # Encode
@@ -175,25 +178,17 @@ def process_context_images_spatial(context_tensors, vae, vae_config_shift_factor
         )
         context_latents_list.append(packed)
         
-        # Prepare IDs with spatial offsets
+        # Prepare IDs with horizontal offsets only
         ids = FluxKontextPipeline._prepare_latent_image_ids(
             1, h // 2, w // 2, accelerator.device, weight_dtype
         )
         
-        # Key changes: Keep tau=1, add spatial offsets
-        ids[..., 0] = 1.0  # All context at tau=1
+        # All context at tau=1, stack horizontally from left to right
+        ids[..., 0] = 1.0  # tau = 1 for all context
+        ids[..., 1] += 0    # No vertical offset (y stays at 0)
+        ids[..., 2] += w_accumulated  # Horizontal offset based on accumulated width
         
-        # Smart tiling: choose direction based on current aspect ratio
-        if h_accumulated > w_accumulated:
-            # Stack horizontally
-            ids[..., 1] += 0
-            ids[..., 2] += w_accumulated
-            w_accumulated += w // 2
-        else:
-            # Stack vertically  
-            ids[..., 1] += h_accumulated
-            ids[..., 2] += 0
-            h_accumulated += h // 2
+        w_accumulated += w // 2  # Add half-width for next image positioning
         
         context_ids_list.append(ids)
     
